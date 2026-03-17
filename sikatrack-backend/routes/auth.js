@@ -20,24 +20,32 @@ function formatPhone(phone) {
   return phone;
 }
 
+// ── Sendexa OTP store (reference IDs from Sendexa) ──
+const sendexaRefs = new Map();
+
 async function sendOTP(phone, otp) {
   try {
     const apiKey    = process.env.SENDEXA_API_KEY;
     const apiSecret = process.env.SENDEXA_API_SECRET;
     const credentials = Buffer.from(`${apiKey}:${apiSecret}`).toString('base64');
 
-    // Sendexa wants +233XXXXXXXXX format
-    const formattedTo = phone.startsWith('+') ? phone : `+${phone}`;
+    const formattedPhone = phone.replace(/^\+/, '').replace(/^233/, '0');
 
     const body = {
-      to:      formattedTo,
-      from:    'Exa Auth',
-      content: `Your SikaTrack code is ${otp}. Valid for 10 minutes. Do not share this code.`,
+      phone:      formattedPhone,
+      from:       'Exa Auth',
+      message:    'Your SikaTrack code is {code}. Valid for 10 minutes.',
+      pinLength:  6,
+      pinType:    'NUMERIC',
+      expiry: {
+        amount:   10,
+        duration: 'minutes'
+      }
     };
 
-    console.log('Sending SMS to Sendexa:', formattedTo);
+    console.log('Sending OTP via Sendexa to:', formattedPhone);
 
-    const response = await fetch('https://api.sendexa.co/v2/sms/send', {
+    const response = await fetch('https://api.sendexa.co/v1/otp/request', {
       method: 'POST',
       headers: {
         'Authorization': `Basic ${credentials}`,
@@ -48,21 +56,55 @@ async function sendOTP(phone, otp) {
     });
 
     const data = await response.json();
-    console.log('Sendexa response:', JSON.stringify(data));
+    console.log('Sendexa OTP response:', JSON.stringify(data));
 
-    if (!response.ok) {
-      console.error('Sendexa SMS failed:', data);
-      console.log(`📱 OTP for ${phone}: ${otp}`);
-      return true;
+    if (response.ok && data.data?.reference) {
+      // Store Sendexa reference so we can verify with them later
+      sendexaRefs.set(phone, data.data.reference);
+      console.log(`✅ OTP sent via Sendexa to ${formattedPhone}, ref: ${data.data.reference}`);
+      return { sendexa: true, ref: data.data.reference };
     }
 
-    console.log(`✅ OTP SMS sent to ${phone}`);
-    return true;
+    // Sendexa failed — fall back to local OTP (log only)
+    console.error('Sendexa failed:', data);
+    console.log(`📱 FALLBACK OTP for ${phone}: ${otp}`);
+    return { sendexa: false };
 
   } catch (err) {
     console.error('Sendexa request failed:', err.message);
-    console.log(`📱 OTP for ${phone}: ${otp}`);
-    return true;
+    console.log(`📱 FALLBACK OTP for ${phone}: ${otp}`);
+    return { sendexa: false };
+  }
+}
+
+async function verifySendexaOTP(phone, code) {
+  try {
+    const ref = sendexaRefs.get(phone);
+    if (!ref) return null; // no Sendexa ref — use local verification
+
+    const apiKey    = process.env.SENDEXA_API_KEY;
+    const apiSecret = process.env.SENDEXA_API_SECRET;
+    const credentials = Buffer.from(`${apiKey}:${apiSecret}`).toString('base64');
+
+    const response = await fetch('https://api.sendexa.co/v1/otp/verify', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${credentials}`,
+        'Content-Type':  'application/json',
+        'Accept':        'application/json',
+      },
+      body: JSON.stringify({ reference: ref, code })
+    });
+
+    const data = await response.json();
+    console.log('Sendexa verify response:', JSON.stringify(data));
+
+    sendexaRefs.delete(phone);
+    return data.data?.valid === true || data.status === true;
+
+  } catch (err) {
+    console.error('Sendexa verify error:', err.message);
+    return null;
   }
 }
 
@@ -112,7 +154,13 @@ router.post('/verify-otp', async (req, res) => {
       otpStore.delete(formattedPhone);
       return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
     }
-    if (stored.otp !== otp.toString()) {
+
+    // Try Sendexa verification first if we have a reference
+    const sendexaResult = await verifySendexaOTP(formattedPhone, otp.toString());
+    const localValid    = stored.otp === otp.toString();
+
+    // Accept if either Sendexa or local OTP matches
+    if (sendexaResult === null ? !localValid : !sendexaResult) {
       return res.status(400).json({ error: 'Wrong OTP. Try again.' });
     }
 
