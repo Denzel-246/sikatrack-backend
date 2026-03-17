@@ -1,43 +1,73 @@
 // ============================================================
-// routes/auth.js — Phone number OTP authentication
+// routes/auth.js — Phone number OTP + PIN authentication
 // ============================================================
 const express  = require('express');
 const jwt      = require('jsonwebtoken');
 const supabase = require('../supabase');
 const router   = express.Router();
 
-/* ── In-memory OTP store (works for small scale) ── */
-/* For production use Redis or store in Supabase */
 const otpStore = new Map();
 
-/* ── Generate 6-digit OTP ── */
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-/* ── Format Ghana phone number ── */
 function formatPhone(phone) {
-  // Remove spaces and dashes
   phone = phone.replace(/[\s-]/g, '');
-  // Add Ghana country code if not present
-  if (phone.startsWith('0')) phone = '+233' + phone.slice(1);
-  if (!phone.startsWith('+')) phone = '+233' + phone;
+  if (phone.startsWith('0')) phone = '233' + phone.slice(1);
+  if (phone.startsWith('+233')) phone = phone.slice(1);
+  if (!phone.startsWith('233')) phone = '233' + phone;
   return phone;
 }
 
-/* ── Send OTP via console (replace with SMS provider later) ── */
 async function sendOTP(phone, otp) {
-  // For now we log it — in production integrate with
-  // Hubtel SMS, mNotify, or Africa's Talking for Ghana SMS
-  console.log(`\n📱 OTP for ${phone}: ${otp}\n`);
-  // TODO: Replace with real SMS sending:
-  // await sendSMS(phone, `Your SikaTrack OTP is: ${otp}. Valid for 10 minutes.`);
-  return true;
+  try {
+    const apiKey    = process.env.SENDEXA_API_KEY;
+    const apiSecret = process.env.SENDEXA_API_SECRET;
+    const credentials = Buffer.from(`${apiKey}:${apiSecret}`).toString('base64');
+
+    // Sendexa wants +233XXXXXXXXX format
+    const formattedTo = phone.startsWith('+') ? phone : `+${phone}`;
+
+    const body = {
+      to:      formattedTo,
+      from:    'Exa Auth',
+      content: `Your SikaTrack code is ${otp}. Valid for 10 minutes. Do not share this code.`,
+    };
+
+    console.log('Sending SMS to Sendexa:', formattedTo);
+
+    const response = await fetch('https://api.sendexa.co/v2/sms/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${credentials}`,
+        'Content-Type':  'application/json',
+        'Accept':        'application/json',
+      },
+      body: JSON.stringify(body)
+    });
+
+    const data = await response.json();
+    console.log('Sendexa response:', JSON.stringify(data));
+
+    if (!response.ok) {
+      console.error('Sendexa SMS failed:', data);
+      console.log(`📱 OTP for ${phone}: ${otp}`);
+      return true;
+    }
+
+    console.log(`✅ OTP SMS sent to ${phone}`);
+    return true;
+
+  } catch (err) {
+    console.error('Sendexa request failed:', err.message);
+    console.log(`📱 OTP for ${phone}: ${otp}`);
+    return true;
+  }
 }
 
 /* ══════════════════════════════════
    POST /auth/send-otp
-   Send OTP to phone number
 ══════════════════════════════════ */
 router.post('/send-otp', async (req, res) => {
   try {
@@ -46,28 +76,20 @@ router.post('/send-otp', async (req, res) => {
 
     const formattedPhone = formatPhone(phone);
 
-    // Validate Ghana phone number
-    if (!formattedPhone.match(/^\+233[0-9]{9}$/)) {
+    if (!formattedPhone.match(/^233[0-9]{9}$/)) {
       return res.status(400).json({ error: 'Enter a valid Ghana phone number' });
     }
 
-    // Generate OTP
-    const otp     = generateOTP();
-    const expiry  = Date.now() + (parseInt(process.env.OTP_EXPIRY_MINUTES) * 60 * 1000);
-
-    // Store OTP
+    const otp    = generateOTP();
+    const expiry = Date.now() + (parseInt(process.env.OTP_EXPIRY_MINUTES) * 60 * 1000);
     otpStore.set(formattedPhone, { otp, expiry, name });
-
-    // Send OTP
     await sendOTP(formattedPhone, otp);
 
     res.json({
       success: true,
       message: `OTP sent to ${formattedPhone}`,
-      // Remove this in production — only for testing:
       dev_otp: process.env.NODE_ENV === 'development' ? otp : undefined
     });
-
   } catch (err) {
     console.error('Send OTP error:', err);
     res.status(500).json({ error: 'Failed to send OTP' });
@@ -76,7 +98,6 @@ router.post('/send-otp', async (req, res) => {
 
 /* ══════════════════════════════════
    POST /auth/verify-otp
-   Verify OTP and log in / sign up
 ══════════════════════════════════ */
 router.post('/verify-otp', async (req, res) => {
   try {
@@ -86,49 +107,39 @@ router.post('/verify-otp', async (req, res) => {
     const formattedPhone = formatPhone(phone);
     const stored         = otpStore.get(formattedPhone);
 
-    // Check OTP exists
     if (!stored) return res.status(400).json({ error: 'No OTP found. Please request a new one.' });
-
-    // Check OTP expiry
     if (Date.now() > stored.expiry) {
       otpStore.delete(formattedPhone);
       return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
     }
-
-    // Check OTP matches
     if (stored.otp !== otp.toString()) {
       return res.status(400).json({ error: 'Wrong OTP. Try again.' });
     }
 
-    // OTP is valid — clear it
     otpStore.delete(formattedPhone);
 
-    // Check if user exists in Supabase
     let { data: user } = await supabase
       .from('users')
       .select('*')
       .eq('phone', formattedPhone)
       .single();
 
-    // If no user — create one
     if (!user) {
       const { data: newUser, error } = await supabase
         .from('users')
         .insert({
-          phone:        formattedPhone,
-          name:         stored.name || 'My Shop',
-          plan:         'free',
-          trial_ends:   new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 day trial
-          created_at:   new Date().toISOString()
+          phone:      formattedPhone,
+          name:       stored.name || 'My Shop',
+          plan:       'free',
+          trial_ends: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: new Date().toISOString()
         })
         .select()
         .single();
-
-      if (error) throw error;
+      if (error) { console.error('Supabase insert error:', error); throw error; }
       user = newUser;
     }
 
-    // Generate JWT token
     const token = jwt.sign(
       { userId: user.id, phone: user.phone },
       process.env.JWT_SECRET,
@@ -139,14 +150,14 @@ router.post('/verify-otp', async (req, res) => {
       success: true,
       token,
       user: {
-        id:          user.id,
-        name:        user.name,
-        phone:       user.phone,
-        plan:        user.plan,
-        trial_ends:  user.trial_ends
+        id:         user.id,
+        name:       user.name,
+        phone:      user.phone,
+        plan:       user.plan,
+        trial_ends: user.trial_ends,
+        has_pin:    !!user.pin
       }
     });
-
   } catch (err) {
     console.error('Verify OTP error:', err);
     res.status(500).json({ error: 'Verification failed' });
@@ -154,8 +165,75 @@ router.post('/verify-otp', async (req, res) => {
 });
 
 /* ══════════════════════════════════
+   POST /auth/set-pin
+══════════════════════════════════ */
+router.post('/set-pin', requireAuth, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    if (!pin || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
+      return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+    }
+
+    const { error } = await supabase
+      .from('users')
+      .update({ pin })
+      .eq('id', req.userId);
+
+    if (error) throw error;
+
+    res.json({ success: true, message: 'PIN saved successfully' });
+  } catch (err) {
+    console.error('Set PIN error:', err);
+    res.status(500).json({ error: 'Failed to save PIN' });
+  }
+});
+
+/* ══════════════════════════════════
+   POST /auth/verify-pin
+══════════════════════════════════ */
+router.post('/verify-pin', async (req, res) => {
+  try {
+    const { phone, pin } = req.body;
+    if (!phone || !pin) return res.status(400).json({ error: 'Phone and PIN are required' });
+
+    const formattedPhone = formatPhone(phone);
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('*')
+      .eq('phone', formattedPhone)
+      .single();
+
+    if (!user) return res.status(400).json({ error: 'No account found for this number' });
+    if (!user.pin) return res.status(400).json({ error: 'No PIN set. Please log in with OTP.' });
+    if (user.pin !== pin) return res.status(400).json({ error: 'Wrong PIN. Try again.' });
+
+    const token = jwt.sign(
+      { userId: user.id, phone: user.phone },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        id:         user.id,
+        name:       user.name,
+        phone:      user.phone,
+        plan:       user.plan,
+        trial_ends: user.trial_ends,
+        has_pin:    true
+      }
+    });
+  } catch (err) {
+    console.error('Verify PIN error:', err);
+    res.status(500).json({ error: 'PIN verification failed' });
+  }
+});
+
+/* ══════════════════════════════════
    GET /auth/me
-   Get current user info
 ══════════════════════════════════ */
 router.get('/me', requireAuth, async (req, res) => {
   try {
@@ -172,7 +250,8 @@ router.get('/me', requireAuth, async (req, res) => {
       name:       user.name,
       phone:      user.phone,
       plan:       user.plan,
-      trial_ends: user.trial_ends
+      trial_ends: user.trial_ends,
+      has_pin:    !!user.pin
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to get user' });

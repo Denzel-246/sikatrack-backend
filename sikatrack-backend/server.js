@@ -14,11 +14,11 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 /* ── Routes ── */
-app.use('/auth',     require('./routes/auth'));
-app.use('/sales',    require('./routes/sales'));
-app.use('/expenses', require('./routes/expenses'));
-app.use('/inventory',require('./routes/inventory'));
-app.use('/payments', require('./routes/payments'));
+app.use('/auth',      require('./routes/auth'));
+app.use('/sales',     require('./routes/sales'));
+app.use('/expenses',  require('./routes/expenses'));
+app.use('/inventory', require('./routes/inventory'));
+app.use('/payment',   require('./routes/payment'));
 
 /* ── Health check ── */
 app.get('/', (req, res) => {
