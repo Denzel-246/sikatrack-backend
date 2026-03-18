@@ -6,8 +6,8 @@ const crypto   = require('crypto');
 const router   = express.Router();
 
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
-const MONTHLY_AMOUNT  = 3000;   // GH₵30 in pesewas
-const YEARLY_AMOUNT   = 27000;  // GH₵270 in pesewas
+const MONTHLY_AMOUNT  = 5000;   // GH₵50 in pesewas
+const YEARLY_AMOUNT   = 45000;  // GH₵450 in pesewas
 
 // ── Helper: activate Pro in Supabase ──────────────────────
 async function activatePro(phone, plan) {
